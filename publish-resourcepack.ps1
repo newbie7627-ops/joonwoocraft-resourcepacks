@@ -7,15 +7,25 @@ param(
     [string]$Tag
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Assert-LastExitCode {
+function Assert-ExitCode {
     param(
+        [Parameter(Mandatory=$true)][int]$Code,
         [Parameter(Mandatory=$true)][string]$Message
     )
-    if ($LASTEXITCODE -ne 0) {
+    if ($Code -ne 0) {
         throw $Message
     }
+}
+
+function Remove-AttemptRelease {
+    param(
+        [Parameter(Mandatory=$true)][string]$ReleaseTag,
+        [Parameter(Mandatory=$true)][string]$Repository
+    )
+    gh release delete $ReleaseTag --repo $Repository --cleanup-tag --yes *> $null
 }
 
 $resolved = Resolve-Path -LiteralPath $ZipPath
@@ -50,10 +60,10 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 
 # Verify GitHub authentication and repository access before touching a release.
 gh auth status --hostname github.com | Out-Host
-Assert-LastExitCode "GitHub CLI is not authenticated for github.com. Run once: gh auth login"
+Assert-ExitCode -Code $LASTEXITCODE -Message "GitHub CLI is not authenticated for github.com. Run once: gh auth login"
 
 $defaultBranch = gh repo view $Repo --json defaultBranchRef --jq '.defaultBranchRef.name'
-Assert-LastExitCode "Cannot access repository '$Repo'."
+Assert-ExitCode -Code $LASTEXITCODE -Message "Cannot access repository '$Repo'."
 $defaultBranch = ($defaultBranch | Out-String).Trim()
 if (-not $defaultBranch) {
     throw "Could not determine the default branch for '$Repo'."
@@ -68,15 +78,8 @@ try {
         throw "ZIP contains no entries."
     }
 
-    $duplicate = $archive.Entries | Group-Object FullName | Where-Object { $_.Count -gt 1 }
-    if ($duplicate) {
-        throw "ZIP contains duplicate entries: $($duplicate.Name -join ', ')"
-    }
-
-    $caseDuplicate = $archive.Entries | Group-Object { $_.FullName.ToLowerInvariant() } | Where-Object { $_.Count -gt 1 }
-    if ($caseDuplicate) {
-        throw "ZIP contains case-colliding paths: $($caseDuplicate.Name -join ', ')"
-    }
+    $exactNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $foldedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     $packMeta = $archive.GetEntry('pack.mcmeta')
     if (-not $packMeta) {
@@ -85,8 +88,16 @@ try {
 
     $hasAssets = $false
     $buffer = New-Object byte[] 65536
+
     foreach ($entry in $archive.Entries) {
         $entryName = $entry.FullName
+
+        if (-not $exactNames.Add($entryName)) {
+            throw "ZIP contains duplicate entry '$entryName'."
+        }
+        if (-not $foldedNames.Add($entryName)) {
+            throw "ZIP contains case-colliding path '$entryName'."
+        }
 
         if ($entryName.StartsWith('/') -or $entryName.StartsWith('\\') -or $entryName -match '(^|/)\.\.(/|$)') {
             throw "Unsafe ZIP path detected: '$entryName'"
@@ -132,7 +143,7 @@ try {
 }
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
-$size = $file.Length
+$size = [int64]$file.Length
 
 Write-Host "ZIP: $zip"
 Write-Host "TAG: $Tag"
@@ -140,17 +151,18 @@ Write-Host "TARGET: $defaultBranch"
 Write-Host "SIZE: $size bytes"
 Write-Host "SHA256: $hash"
 
-# Refuse to collide with an existing release or Git tag.
-$releaseListJson = gh release list --repo $Repo --limit 100 --json tagName
-Assert-LastExitCode "Could not query existing releases for '$Repo'."
-$releaseList = $releaseListJson | ConvertFrom-Json
-if ($releaseList | Where-Object { $_.tagName -eq $Tag }) {
+# Refuse to collide with any existing release. Use the paginated REST endpoint so this
+# remains correct even after the repository has more than 100 releases.
+$releaseTags = @(gh api --paginate "repos/$Repo/releases" --jq '.[].tag_name')
+Assert-ExitCode -Code $LASTEXITCODE -Message "Could not query existing releases for '$Repo'."
+if ($releaseTags -contains $Tag) {
     throw "Release '$Tag' already exists. Refusing to overwrite it."
 }
 
+# Refuse to collide with an existing Git tag, even if no release exists for it.
 $tagRefsJson = gh api "repos/$Repo/git/matching-refs/tags/$Tag"
-Assert-LastExitCode "Could not query existing tags for '$Repo'."
-$tagRefs = $tagRefsJson | ConvertFrom-Json
+Assert-ExitCode -Code $LASTEXITCODE -Message "Could not query existing tags for '$Repo'."
+$tagRefs = @($tagRefsJson | ConvertFrom-Json)
 if ($tagRefs.Count -gt 0) {
     throw "Git tag '$Tag' already exists. Refusing to reuse it automatically."
 }
@@ -165,32 +177,32 @@ Size: $size bytes
 # Create the tag/release and upload the exact ZIP.
 gh release create $Tag $zip --repo $Repo --title $Tag --notes $notes --target $defaultBranch
 if ($LASTEXITCODE -ne 0) {
-    # A failed upload can leave a partial release/tag. Since both were confirmed absent
-    # immediately before this command, clean up only this newly attempted release.
-    gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-    throw "GitHub release creation/upload failed. Any partial release/tag from this attempt was cleaned up."
+    # A failed upload can leave a partial release/tag. Both were confirmed absent above,
+    # so cleanup is restricted to this newly-attempted tag.
+    Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+    throw "GitHub release creation/upload failed. Cleanup of this attempt was requested."
 }
 
 # Verify server-side metadata.
 $releaseJson = gh api "repos/$Repo/releases/tags/$Tag"
 if ($LASTEXITCODE -ne 0) {
-    gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-    throw "Release was created but could not be read back. The new release/tag was cleaned up."
+    Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+    throw "Release was created but could not be read back. Cleanup of this attempt was requested."
 }
 
 $release = $releaseJson | ConvertFrom-Json
-$asset = $release.assets | Where-Object { $_.name -eq $expectedName } | Select-Object -First 1
+$asset = @($release.assets | Where-Object { $_.name -eq $expectedName }) | Select-Object -First 1
 if (-not $asset) {
-    gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-    throw "Release was created but '$expectedName' is missing. The new release/tag was cleaned up."
+    Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+    throw "Release was created but '$expectedName' is missing. Cleanup of this attempt was requested."
 }
 if ($asset.state -ne 'uploaded') {
-    gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-    throw "Uploaded asset is not in state 'uploaded'. The new release/tag was cleaned up."
+    Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+    throw "Uploaded asset is not in state 'uploaded'. Cleanup of this attempt was requested."
 }
-if ([int64]$asset.size -ne [int64]$size) {
-    gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-    throw "Uploaded asset size mismatch. The new release/tag was cleaned up."
+if ([int64]$asset.size -ne $size) {
+    Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+    throw "Uploaded asset size mismatch. Cleanup of this attempt was requested."
 }
 
 # End-to-end verification: download the just-published asset into a fresh temp directory
@@ -201,20 +213,20 @@ New-Item -ItemType Directory -Path $verifyDir | Out-Null
 try {
     gh release download $Tag --repo $Repo --pattern $expectedName --dir $verifyDir
     if ($LASTEXITCODE -ne 0) {
-        gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-        throw "Could not download the published asset for verification. The new release/tag was cleaned up."
+        Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+        throw "Could not download the published asset for verification. Cleanup of this attempt was requested."
     }
 
     $downloaded = Join-Path $verifyDir $expectedName
     if (-not (Test-Path -LiteralPath $downloaded)) {
-        gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-        throw "Published asset verification file is missing. The new release/tag was cleaned up."
+        Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+        throw "Published asset verification file is missing. Cleanup of this attempt was requested."
     }
 
     $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloaded).Hash.ToLowerInvariant()
     if ($remoteHash -ne $hash) {
-        gh release delete $Tag --repo $Repo --cleanup-tag --yes *> $null
-        throw "Published asset SHA256 mismatch. The bad release/tag was cleaned up. Local=$hash Remote=$remoteHash"
+        Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
+        throw "Published asset SHA256 mismatch. Cleanup of the bad release was requested. Local=$hash Remote=$remoteHash"
     }
 } finally {
     Remove-Item -LiteralPath $verifyDir -Recurse -Force -ErrorAction SilentlyContinue
