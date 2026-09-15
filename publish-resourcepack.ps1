@@ -25,6 +25,9 @@ function Remove-AttemptRelease {
         [Parameter(Mandatory=$true)][string]$ReleaseTag,
         [Parameter(Mandatory=$true)][string]$Repository
     )
+
+    # Best-effort cleanup only after this script has confirmed the release was created.
+    # Suppress cleanup errors so the original verification error is preserved.
     gh release delete $ReleaseTag --repo $Repository --cleanup-tag --yes *> $null
 }
 
@@ -58,7 +61,6 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "GitHub CLI (gh) is not installed. Install once with: winget install --id GitHub.cli"
 }
 
-# Verify GitHub authentication and repository access before touching a release.
 gh auth status --hostname github.com | Out-Host
 Assert-ExitCode -Code $LASTEXITCODE -Message "GitHub CLI is not authenticated for github.com. Run once: gh auth login"
 
@@ -69,8 +71,6 @@ if (-not $defaultBranch) {
     throw "Could not determine the default branch for '$Repo'."
 }
 
-# Deep ZIP validation. Opening the archive alone only validates the central directory,
-# so every file stream is read completely to catch truncated/corrupt compressed data.
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
 try {
@@ -151,19 +151,20 @@ Write-Host "TARGET: $defaultBranch"
 Write-Host "SIZE: $size bytes"
 Write-Host "SHA256: $hash"
 
-# Refuse to collide with any existing release. Use the paginated REST endpoint so this
-# remains correct even after the repository has more than 100 releases.
 $releaseTags = @(gh api --paginate "repos/$Repo/releases" --jq '.[].tag_name')
 Assert-ExitCode -Code $LASTEXITCODE -Message "Could not query existing releases for '$Repo'."
 if ($releaseTags -contains $Tag) {
     throw "Release '$Tag' already exists. Refusing to overwrite it."
 }
 
-# Refuse to collide with an existing Git tag, even if no release exists for it.
+# Check only the exact tag. GitHub's matching-refs endpoint is prefix-based,
+# so counting every result would falsely reject e.g. 1.0.8 when 1.0.80 exists.
 $tagRefsJson = gh api "repos/$Repo/git/matching-refs/tags/$Tag"
-Assert-ExitCode -Code $LASTEXITCODE -Message "Could not query existing tags for '$Repo'."
-$tagRefs = @($tagRefsJson | ConvertFrom-Json)
-if ($tagRefs.Count -gt 0) {
+$tagCheckExit = $LASTEXITCODE
+Assert-ExitCode -Code $tagCheckExit -Message "Could not query existing tags for '$Repo'."
+$tagRefs = @($tagRefsJson | ConvertFrom-Json | Where-Object { $_ -ne $null })
+$exactTagRef = "refs/tags/$Tag"
+if ($tagRefs | Where-Object { $_.ref -eq $exactTagRef }) {
     throw "Git tag '$Tag' already exists. Refusing to reuse it automatically."
 }
 
@@ -174,16 +175,13 @@ SHA256: $hash
 Size: $size bytes
 "@
 
-# Create the tag/release and upload the exact ZIP.
 gh release create $Tag $zip --repo $Repo --title $Tag --notes $notes --target $defaultBranch
 if ($LASTEXITCODE -ne 0) {
-    # A failed upload can leave a partial release/tag. Both were confirmed absent above,
-    # so cleanup is restricted to this newly-attempted tag.
-    Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
-    throw "GitHub release creation/upload failed. Cleanup of this attempt was requested."
+    # Do not automatically delete a tag here. A concurrent/manual tag could have
+    # appeared after the preflight check, and deleting it would be destructive.
+    throw "GitHub release creation/upload failed. No existing tag/release was overwritten."
 }
 
-# Verify server-side metadata.
 $releaseJson = gh api "repos/$Repo/releases/tags/$Tag"
 if ($LASTEXITCODE -ne 0) {
     Remove-AttemptRelease -ReleaseTag $Tag -Repository $Repo
@@ -205,9 +203,6 @@ if ([int64]$asset.size -ne $size) {
     throw "Uploaded asset size mismatch. Cleanup of this attempt was requested."
 }
 
-# End-to-end verification: download the just-published asset into a fresh temp directory
-# and compare SHA256 with the local source ZIP. This catches a bad/truncated upload even
-# when release creation itself reported success.
 $verifyDir = Join-Path ([System.IO.Path]::GetTempPath()) ("joonwoocraft-rp-verify-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $verifyDir | Out-Null
 try {
